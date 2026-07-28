@@ -18099,8 +18099,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     query_batches > device->properties.limits.maxComputeWorkGroupCount[2]) {
                     return false;
                 }
-                // Keep disabled until the shader computes and writes the complete score tensor.
-                return false;
+                return true;
             }
         case GGML_OP_SSM_SCAN:
             {
