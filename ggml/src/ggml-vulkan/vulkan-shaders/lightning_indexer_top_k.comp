@@ -1,0 +1,119 @@
+#version 450
+
+#extension GL_EXT_shader_16bit_storage : require
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Parameters {
+    uint D;
+    uint H;
+    uint T;
+    uint S;
+    uint C;
+    uint M;
+    uint q1;
+    uint q2;
+    uint q3;
+    uint k2;
+    uint k3;
+    uint w1;
+    uint w3;
+    uint m1;
+    uint m3;
+    uint top_k;
+};
+
+layout(binding = 0) readonly buffer QBuf       { float data_q[];        };
+layout(binding = 1) readonly buffer KBuf       { float data_k[];        };
+layout(binding = 2) readonly buffer WeightsBuf { float data_weights[];  };
+layout(binding = 3) readonly buffer MaskBuf    { float16_t data_mask[]; };
+layout(binding = 4)          buffer DstBuf     { int data_dst[];        };
+
+shared float partial[128];
+shared float heap_scores[2048];
+shared int heap_indices[2048];
+
+bool better(float score_a, int index_a, float score_b, int index_b) {
+    return score_a > score_b || (score_a == score_b && index_a < index_b);
+}
+
+void swap_heap(uint a, uint b) {
+    float score = heap_scores[a];
+    int index = heap_indices[a];
+    heap_scores[a] = heap_scores[b];
+    heap_indices[a] = heap_indices[b];
+    heap_scores[b] = score;
+    heap_indices[b] = index;
+}
+
+void main() {
+    const uint d = gl_LocalInvocationID.x;
+    const uint t = gl_WorkGroupID.y;
+    const uint s = gl_WorkGroupID.z;
+    uint heap_size = 0;
+
+    for (uint c = 0; c < C; ++c) {
+        float score = 0.0;
+        const uint k_base = c * k2 + s * k3;
+
+        for (uint h = 0; h < H; ++h) {
+            const uint q_base = h * q1 + t * q2 + s * q3;
+            partial[d] = data_q[q_base + d] * data_k[k_base + d];
+            barrier();
+
+            for (uint stride = 64; stride > 0; stride >>= 1) {
+                if (d < stride) {
+                    partial[d] += partial[d + stride];
+                }
+                barrier();
+            }
+
+            if (d == 0) {
+                score += max(partial[0], 0.0) * data_weights[h + t * w1 + s * w3];
+            }
+            barrier();
+        }
+
+        if (d == 0) {
+            score += float(data_mask[c + t * m1 + (s % M) * m3]);
+            if (heap_size < top_k) {
+                uint pos = heap_size++;
+                heap_scores[pos] = score;
+                heap_indices[pos] = int(c);
+                while (pos > 0) {
+                    const uint parent = (pos - 1)/2;
+                    if (!better(heap_scores[parent], heap_indices[parent], heap_scores[pos], heap_indices[pos])) {
+                        break;
+                    }
+                    swap_heap(parent, pos);
+                    pos = parent;
+                }
+            } else if (better(score, int(c), heap_scores[0], heap_indices[0])) {
+                heap_scores[0] = score;
+                heap_indices[0] = int(c);
+                uint pos = 0;
+                for (;;) {
+                    const uint left = 2*pos + 1;
+                    if (left >= top_k) {
+                        break;
+                    }
+                    const uint right = left + 1;
+                    uint worse = left;
+                    if (right < top_k && better(heap_scores[left], heap_indices[left], heap_scores[right], heap_indices[right])) {
+                        worse = right;
+                    }
+                    if (!better(heap_scores[pos], heap_indices[pos], heap_scores[worse], heap_indices[worse])) {
+                        break;
+                    }
+                    swap_heap(pos, worse);
+                    pos = worse;
+                }
+            }
+        }
+        barrier();
+    }
+
+    for (uint i = d; i < top_k; i += 128) {
+        data_dst[i + top_k*t + top_k*T*s] = heap_indices[i];
+    }
+}

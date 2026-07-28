@@ -340,9 +340,10 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
 
                 ggml_tensor * indexer_score = nullptr;
                 if (cparams.fused_lid) {
-                    indexer_score = ggml_lightning_indexer(ctx0, indexer_q, indexer_k, indexer_weights, inp_attn_dsa->get_kq_mask_lid());
-                    cb(indexer_score, "indexer_score", il);
-                    res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, indexer_score, il});
+                    const uint32_t n_top_k = std::min<uint32_t>(indexer_k->ne[2], n_indexer_top_k);
+                    top_k = ggml_lightning_indexer_top_k(ctx0, indexer_q, indexer_k, indexer_weights, inp_attn_dsa->get_kq_mask_lid(), n_top_k);
+                    cb(top_k, "top_k", il);
+                    res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, top_k, il});
                 } else {
                     // calculate indexer kq
                     indexer_q = ggml_permute(ctx0, indexer_q, 0, 2, 1, 3);
@@ -377,11 +378,11 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
                     ggml_tensor * indexer_kq_mask = inp_attn_dsa->get_kq_mask_lid();
                     indexer_score = ggml_add(ctx0, indexer_score, indexer_kq_mask);
                     cb(indexer_score, "indexer_score", il);
-                }
 
-                // get indices of top k indexer scores
-                uint32_t n_top_k = indexer_score->ne[0] < n_indexer_top_k ? indexer_score->ne[0] : n_indexer_top_k;
-                top_k = ggml_cont(ctx0, ggml_top_k(ctx0, indexer_score, n_top_k));
+                    // get indices of top k indexer scores
+                    uint32_t n_top_k = indexer_score->ne[0] < n_indexer_top_k ? indexer_score->ne[0] : n_indexer_top_k;
+                    top_k = ggml_cont(ctx0, ggml_top_k(ctx0, indexer_score, n_top_k));
+                }
                 prev_top_k = top_k;
                 cb(top_k, "top_k", il);
             } else {

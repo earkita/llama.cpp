@@ -467,6 +467,35 @@ Focused baseline command:
 build-vulkan-debug/bin/test-backend-ops test -o LIGHTNING_INDEXER -b CPU
 ```
 
+## Stage 6 bounded-memory top-k
+
+`GGML_OP_LIGHTNING_INDEXER_TOP_K` preserves the score formula but emits only I32 candidate indices. The DeepSeek 3.2, DeepSeek 4, and GLM DSA fused graph paths use this operation instead of materializing `LIGHTNING_INDEXER -> TOP_K`.
+
+The correctness-first Vulkan kernel assigns one workgroup to each `(t,s)` query row. It streams across all `C` candidates and maintains a deterministic min-heap with capacity `K`. Equal scores prefer the lower candidate index. No global score or candidate scratch buffer is allocated.
+
+Vulkan memory for this operation is:
+
+- output: `4*K*T*S` bytes
+- global temporary storage: 0 bytes
+- workgroup shared storage: `2*2048*4 + 128*4 = 16896` bytes
+
+The shared allocation is currently fixed because the shader supports any `K <= 2048` with one pipeline. It does not scale with context, token count, ubatch, or the requested K. Output memory scales with `O(K*T*S)`. Context length affects compute time only, so 1K, 4K, 16K, 32K, 64K, and 262K contexts have the same Vulkan temporary-memory requirement.
+
+For `T=1`, `S=1`, and `K=min(C,2048)`:
+
+| Context C | Direct-index output | Global temporary | Workgroup shared | Standalone score output |
+| ---: | ---: | ---: | ---: | ---: |
+| 1K | 4 KiB | 0 | 16.5 KiB | 4 KiB |
+| 4K | 8 KiB | 0 | 16.5 KiB | 16 KiB |
+| 16K | 8 KiB | 0 | 16.5 KiB | 64 KiB |
+| 32K | 8 KiB | 0 | 16.5 KiB | 128 KiB |
+| 64K | 8 KiB | 0 | 16.5 KiB | 256 KiB |
+| 262K | 8 KiB | 0 | 16.5 KiB | 1 MiB |
+
+Token and stream batching multiply both graph-visible output columns by `T*S`. They do not change the per-workgroup shared allocation or introduce global temporary storage. Varying K changes only the direct-index output size; the current fixed-capacity shader's shared allocation remains constant.
+
+The standalone score operation still writes `4*C*T*S` output bytes and remains available for callers that consume scores. It has no temporary Vulkan allocation, but its graph-visible output scales as `O(C*T*S)`.
+
 Result: passed, 108/108 cases. Coverage included `H = 32 or 64`, `T = 1 or 512`, `S = 1 or 4`, shared and per-stream masks, and F32, F16, BF16, Q8_0, Q5_1, Q5_0, Q4_1, Q4_0, and IQ4_NL keys.
 
 The test process reported `ggml_vulkan: No devices found`, so no Vulkan execution baseline was possible in this environment. This is expected before the operation is implemented but means later Vulkan correctness and validation criteria require access to the target GPU environment.

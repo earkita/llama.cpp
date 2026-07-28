@@ -43,6 +43,111 @@ static void ggml_compute_forward_dup_same_cont(
     }
 }
 
+void ggml_compute_forward_lightning_indexer_top_k(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * q = dst->src[0];
+    const ggml_tensor * k = dst->src[1];
+    const ggml_tensor * w = dst->src[2];
+    const ggml_tensor * m = dst->src[3];
+
+    GGML_ASSERT(dst->type == GGML_TYPE_I32);
+    GGML_ASSERT(q->type == GGML_TYPE_F32);
+    GGML_ASSERT(w->type == GGML_TYPE_F32);
+    GGML_ASSERT(m->type == GGML_TYPE_F16);
+
+    const int64_t D = q->ne[0];
+    const int64_t H = q->ne[1];
+    const int64_t T = q->ne[2];
+    const int64_t S = q->ne[3];
+    const int64_t C = k->ne[2];
+    const int64_t K = dst->ne[0];
+
+    ggml_to_float_t const k_to_float = ggml_get_type_traits(k->type)->to_float;
+    GGML_ASSERT((k->type == GGML_TYPE_F32 || k_to_float) && "lightning indexer top-k: unsupported K-type");
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+    const size_t per_thread = sizeof(float)*(D + K) + sizeof(int32_t)*K;
+    char * scratch = (char *)params->wdata + per_thread*ith;
+    float * k_row_f32 = (float *)scratch;
+    float * heap_scores = k_row_f32 + D;
+    int32_t * heap_indices = (int32_t *)(heap_scores + K);
+
+    auto better = [](float score_a, int32_t index_a, float score_b, int32_t index_b) {
+        return score_a > score_b || (score_a == score_b && index_a < index_b);
+    };
+    auto swap_heap = [&](int64_t a, int64_t b) {
+        std::swap(heap_scores[a], heap_scores[b]);
+        std::swap(heap_indices[a], heap_indices[b]);
+    };
+
+    for (int64_t row = ith; row < T*S; row += nth) {
+        const int64_t t = row % T;
+        const int64_t s = row / T;
+        const float * w_row = (const float *)((const char *)w->data + t*w->nb[1] + s*w->nb[3]);
+        const ggml_fp16_t * m_row = (const ggml_fp16_t *)((const char *)m->data + t*m->nb[1] + (s % m->ne[3])*m->nb[3]);
+        int64_t heap_size = 0;
+
+        for (int64_t c = 0; c < C; ++c) {
+            const char * k_row = (const char *)k->data + c*k->nb[2] + s*k->nb[3];
+            const float * k_f32;
+            if (k_to_float) {
+                k_to_float(k_row, k_row_f32, D);
+                k_f32 = k_row_f32;
+            } else {
+                k_f32 = (const float *)k_row;
+            }
+
+            float score = 0.0f;
+            for (int64_t h = 0; h < H; ++h) {
+                const float * q_row = (const float *)((const char *)q->data + h*q->nb[1] + t*q->nb[2] + s*q->nb[3]);
+                float qk = 0.0f;
+                ggml_vec_dot_f32(D, &qk, 0, q_row, 0, k_f32, 0, 1);
+                score += MAX(qk, 0.0f)*w_row[h];
+            }
+            score += GGML_CPU_FP16_TO_FP32(m_row[c]);
+
+            if (heap_size < K) {
+                int64_t pos = heap_size++;
+                heap_scores[pos] = score;
+                heap_indices[pos] = (int32_t)c;
+                while (pos > 0) {
+                    const int64_t parent = (pos - 1)/2;
+                    if (!better(heap_scores[parent], heap_indices[parent], heap_scores[pos], heap_indices[pos])) {
+                        break;
+                    }
+                    swap_heap(parent, pos);
+                    pos = parent;
+                }
+            } else if (better(score, (int32_t)c, heap_scores[0], heap_indices[0])) {
+                heap_scores[0] = score;
+                heap_indices[0] = (int32_t)c;
+                int64_t pos = 0;
+                for (;;) {
+                    const int64_t left = 2*pos + 1;
+                    if (left >= K) {
+                        break;
+                    }
+                    const int64_t right = left + 1;
+                    int64_t worse = left;
+                    if (right < K && better(heap_scores[left], heap_indices[left], heap_scores[right], heap_indices[right])) {
+                        worse = right;
+                    }
+                    if (!better(heap_scores[pos], heap_indices[pos], heap_scores[worse], heap_indices[worse])) {
+                        break;
+                    }
+                    swap_heap(pos, worse);
+                    pos = worse;
+                }
+            }
+        }
+
+        int32_t * dst_row = (int32_t *)((char *)dst->data + t*dst->nb[1] + s*dst->nb[3]);
+        std::copy(heap_indices, heap_indices + K, dst_row);
+    }
+}
+
 template<typename src_t, typename dst_t>
 static void ggml_compute_forward_dup_flt(
         const ggml_compute_params * params,

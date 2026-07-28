@@ -7351,6 +7351,42 @@ struct test_lightning_indexer : public test_case {
     }
 };
 
+struct test_lightning_indexer_top_k : public test_lightning_indexer {
+    const int64_t top_k;
+
+    std::string vars() override {
+        return test_lightning_indexer::vars() + "," + VARS_TO_STR1(top_k);
+    }
+
+    test_lightning_indexer_top_k(int64_t nh, int64_t kv, int64_t nb, int64_t ns, int64_t nm, int64_t top_k)
+        : test_lightning_indexer(128, nh, kv, nb, ns, nm, GGML_TYPE_F32),
+          top_k(top_k) {
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hsk, nh, nb, ns);
+        ggml_set_param(q);
+        ggml_set_name(q, "q");
+
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hsk, 1, kv, ns);
+        ggml_set_param(k);
+        ggml_set_name(k, "k");
+
+        ggml_tensor * w = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, nh, nb, 1, ns);
+        ggml_set_param(w);
+        ggml_set_name(w, "w");
+
+        ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, nm);
+        ggml_set_param(m);
+        ggml_set_name(m, "m");
+
+        ggml_tensor * out = ggml_lightning_indexer_top_k(ctx, q, k, w, m, top_k);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 struct test_lightning_indexer_reference : public test_lightning_indexer {
     const std::string case_name;
     std::vector<float> expected;
@@ -9863,6 +9899,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_lightning_indexer_reference("scalar",     1,   1,  1, 1, 1, 1));
     test_cases.emplace_back(new test_lightning_indexer_reference("relu_order", 128, 32, 7, 3, 1, 1));
     test_cases.emplace_back(new test_lightning_indexer_reference("mask_reuse", 128, 32, 65, 2, 4, 2));
+    test_cases.emplace_back(new test_lightning_indexer_top_k(32, 7, 3, 1, 1, 1));
+    test_cases.emplace_back(new test_lightning_indexer_top_k(32, 65, 2, 4, 2, 8));
 
     return test_cases;
 }
