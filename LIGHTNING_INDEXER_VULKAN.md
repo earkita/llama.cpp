@@ -502,6 +502,24 @@ The optimized shader processes 128 candidates per workgroup iteration. Each invo
 
 Set `GGML_VK_DISABLE_LIGHTNING_INDEXER_CANDIDATE_TILE=1` to select the Stage 6 fallback for comparison benchmarks. Both paths use FP32 accumulation, one dispatch, no global temporary storage, and the same deterministic top-k heap.
 
+## Stage 8 GLM-5.2 integration
+
+The GLM-5.2 IQ1_S model uses an F16 Lightning Indexer key cache. The Vulkan top-k implementation therefore has F32-key and F16-key shader variants. Both convert key elements to F32 before multiplication and accumulate scores in F32. Q, weights, and output types are unchanged.
+
+The integration model was `/mnt/ai/models/glm/glm-5.2/UD-IQ1_S/GLM-5.2-UD-IQ1_S-00001-of-00006.gguf`, with six shards totaling 202 GB. The server used `Vulkan0,Vulkan1`, an 8192-token context, batch size 2048, ubatch size 32, Flash Attention, unified KV, automatic layer fitting, and one parallel slot.
+
+The initial probe rejected the fused graph because K was F16 while Vulkan accepted only F32. After adding the F16 variant, CPU, NVIDIA Vulkan, and AMD Vulkan each passed all three focused `LIGHTNING_INDEXER_TOP_K` cases, including the F16-key case.
+
+A temporary one-time dispatch marker reported:
+
+```text
+ggml_vulkan: dispatched LIGHTNING_INDEXER_TOP_K with pipeline lightning_indexer_top_k_f16_candidate_tile
+```
+
+The marker was removed after the test. The previous `Lightning Indexer not supported, set to disabled` warning was absent. The server became healthy and returned `OK.` for a deterministic request. Prompt processing was 1.31 tokens/s and generation was 1.30 tokens/s.
+
+The Ubuntu Khronos validation layer was extracted under `/tmp` and forced with `VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation`. Vulkan loader diagnostics confirmed insertion of both the instance and device validation layers. The focused AMD test and the server run emitted no validation messages, VUIDs, device-loss errors, or CPU-fallback warnings. The installed layer version does not expose `VK_EXT_layer_settings`, so ggml printed its warning about the optional layer-settings extension even though the validation layer itself was active.
+
 Result: passed, 108/108 cases. Coverage included `H = 32 or 64`, `T = 1 or 512`, `S = 1 or 4`, shared and per-stream masks, and F32, F16, BF16, Q8_0, Q5_1, Q5_0, Q4_1, Q4_0, and IQ4_NL keys.
 
 The test process reported `ggml_vulkan: No devices found`, so no Vulkan execution baseline was possible in this environment. This is expected before the operation is implemented but means later Vulkan correctness and validation criteria require access to the target GPU environment.

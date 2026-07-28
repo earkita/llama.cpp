@@ -7358,8 +7358,8 @@ struct test_lightning_indexer_top_k : public test_lightning_indexer {
         return test_lightning_indexer::vars() + "," + VARS_TO_STR1(top_k);
     }
 
-    test_lightning_indexer_top_k(int64_t nh, int64_t kv, int64_t nb, int64_t ns, int64_t nm, int64_t top_k)
-        : test_lightning_indexer(128, nh, kv, nb, ns, nm, GGML_TYPE_F32),
+    test_lightning_indexer_top_k(int64_t nh, int64_t kv, int64_t nb, int64_t ns, int64_t nm, int64_t top_k, ggml_type type_K = GGML_TYPE_F32)
+        : test_lightning_indexer(128, nh, kv, nb, ns, nm, type_K),
           top_k(top_k) {
     }
 
@@ -7368,7 +7368,7 @@ struct test_lightning_indexer_top_k : public test_lightning_indexer {
         ggml_set_param(q);
         ggml_set_name(q, "q");
 
-        ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hsk, 1, kv, ns);
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, type_K, hsk, 1, kv, ns);
         ggml_set_param(k);
         ggml_set_name(k, "k");
 
@@ -9901,6 +9901,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_lightning_indexer_reference("mask_reuse", 128, 32, 65, 2, 4, 2));
     test_cases.emplace_back(new test_lightning_indexer_top_k(32, 7, 3, 1, 1, 1));
     test_cases.emplace_back(new test_lightning_indexer_top_k(32, 65, 2, 4, 2, 8));
+    test_cases.emplace_back(new test_lightning_indexer_top_k(32, 65, 2, 4, 2, 8, GGML_TYPE_F16));
 
     return test_cases;
 }

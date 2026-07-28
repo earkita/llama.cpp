@@ -24,7 +24,7 @@ layout(push_constant) uniform Parameters {
 };
 
 layout(binding = 0) readonly buffer QBuf       { float data_q[];        };
-layout(binding = 1) readonly buffer KBuf       { float data_k[];        };
+layout(binding = 1) readonly buffer KBuf       { K_TYPE data_k[];       };
 layout(binding = 2) readonly buffer WeightsBuf { float data_weights[];  };
 layout(binding = 3) readonly buffer MaskBuf    { float16_t data_mask[]; };
 layout(binding = 4)          buffer DstBuf     { int data_dst[];        };
@@ -99,7 +99,7 @@ void main() {
                 const uint q_base = h*q1 + t*q2 + s*q3;
                 float qk = 0.0;
                 for (uint i = 0; i < D; ++i) {
-                    qk += data_q[q_base + i]*data_k[k_base + i];
+                    qk += data_q[q_base + i]*float(data_k[k_base + i]);
                 }
                 score += max(qk, 0.0)*data_weights[h + t*w1 + s*w3];
             }
@@ -122,7 +122,7 @@ void main() {
         const uint k_base = c*k2 + s*k3;
         for (uint h = 0; h < H; ++h) {
             const uint q_base = h*q1 + t*q2 + s*q3;
-            partial[d] = data_q[q_base + d]*data_k[k_base + d];
+            partial[d] = data_q[q_base + d]*float(data_k[k_base + d]);
             barrier();
             for (uint stride = 64; stride > 0; stride >>= 1) {
                 if (d < stride) {

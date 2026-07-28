@@ -1006,6 +1006,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_lightning_indexer_f32;
     vk_pipeline pipeline_lightning_indexer_top_k_f32;
     vk_pipeline pipeline_lightning_indexer_top_k_f32_candidate_tile;
+    vk_pipeline pipeline_lightning_indexer_top_k_f16;
+    vk_pipeline pipeline_lightning_indexer_top_k_f16_candidate_tile;
     vk_pipeline pipeline_ssm_scan_f32_d128;
     vk_pipeline pipeline_ssm_scan_f32_d256;
     vk_pipeline pipeline_ssm_conv_f32;
@@ -5687,10 +5689,17 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         ggml_vk_create_pipeline(device, device->pipeline_lightning_indexer_top_k_f32,
             "lightning_indexer_top_k_f32", lightning_indexer_top_k_f32_len, lightning_indexer_top_k_f32_data, "main", 5,
             sizeof(vk_op_lightning_indexer_top_k_push_constants), {128, 1, 1}, {}, 1);
+        ggml_vk_create_pipeline(device, device->pipeline_lightning_indexer_top_k_f16,
+            "lightning_indexer_top_k_f16", lightning_indexer_top_k_f16_len, lightning_indexer_top_k_f16_data, "main", 5,
+            sizeof(vk_op_lightning_indexer_top_k_push_constants), {128, 1, 1}, {}, 1);
         if (getenv("GGML_VK_DISABLE_LIGHTNING_INDEXER_CANDIDATE_TILE") == nullptr) {
             ggml_vk_create_pipeline(device, device->pipeline_lightning_indexer_top_k_f32_candidate_tile,
                 "lightning_indexer_top_k_f32_candidate_tile", lightning_indexer_top_k_f32_candidate_tile_len,
                 lightning_indexer_top_k_f32_candidate_tile_data, "main", 5,
+                sizeof(vk_op_lightning_indexer_top_k_push_constants), {128, 1, 1}, {}, 1);
+            ggml_vk_create_pipeline(device, device->pipeline_lightning_indexer_top_k_f16_candidate_tile,
+                "lightning_indexer_top_k_f16_candidate_tile", lightning_indexer_top_k_f16_candidate_tile_len,
+                lightning_indexer_top_k_f16_candidate_tile_data, "main", 5,
                 sizeof(vk_op_lightning_indexer_top_k_push_constants), {128, 1, 1}, {}, 1);
         }
     }
@@ -11378,13 +11387,20 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         }
         return nullptr;
     case GGML_OP_LIGHTNING_INDEXER_TOP_K:
-        if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
-            src2->type == GGML_TYPE_F32 && dst->src[3] && dst->src[3]->type == GGML_TYPE_F16 &&
-            dst->type == GGML_TYPE_I32) {
-            if (ctx->device->pipeline_lightning_indexer_top_k_f32_candidate_tile) {
-                return ctx->device->pipeline_lightning_indexer_top_k_f32_candidate_tile;
+        if (src0->type == GGML_TYPE_F32 && src2->type == GGML_TYPE_F32 &&
+            dst->src[3] && dst->src[3]->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_I32) {
+            if (src1->type == GGML_TYPE_F32) {
+                if (ctx->device->pipeline_lightning_indexer_top_k_f32_candidate_tile) {
+                    return ctx->device->pipeline_lightning_indexer_top_k_f32_candidate_tile;
+                }
+                return ctx->device->pipeline_lightning_indexer_top_k_f32;
             }
-            return ctx->device->pipeline_lightning_indexer_top_k_f32;
+            if (src1->type == GGML_TYPE_F16) {
+                if (ctx->device->pipeline_lightning_indexer_top_k_f16_candidate_tile) {
+                    return ctx->device->pipeline_lightning_indexer_top_k_f16_candidate_tile;
+                }
+                return ctx->device->pipeline_lightning_indexer_top_k_f16;
+            }
         }
         return nullptr;
     case GGML_OP_SSM_SCAN:
@@ -12506,8 +12522,8 @@ static void ggml_vk_lightning_indexer_top_k(ggml_backend_vk_context * ctx, vk_co
             (uint32_t)(q->nb[1] / sizeof(float)),
             (uint32_t)(q->nb[2] / sizeof(float)),
             (uint32_t)(q->nb[3] / sizeof(float)),
-            (uint32_t)(k->nb[2] / sizeof(float)),
-            (uint32_t)(k->nb[3] / sizeof(float)),
+            (uint32_t)(k->nb[2] / ggml_type_size(k->type)),
+            (uint32_t)(k->nb[3] / ggml_type_size(k->type)),
             (uint32_t)(weights->nb[1] / sizeof(float)),
             (uint32_t)(weights->nb[3] / sizeof(float)),
             (uint32_t)(mask->nb[1] / sizeof(ggml_fp16_t)),
@@ -18188,9 +18204,10 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 const ggml_tensor * weights = op->src[2];
                 const ggml_tensor * mask    = op->src[3];
 
-                if (!device->pipeline_lightning_indexer_top_k_f32 ||
-                    !q || !k || !weights || !mask ||
-                    q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_F32 ||
+                if (!q || !k || !weights || !mask ||
+                    (!device->pipeline_lightning_indexer_top_k_f32 && k->type == GGML_TYPE_F32) ||
+                    (!device->pipeline_lightning_indexer_top_k_f16 && k->type == GGML_TYPE_F16) ||
+                    q->type != GGML_TYPE_F32 || (k->type != GGML_TYPE_F32 && k->type != GGML_TYPE_F16) ||
                     weights->type != GGML_TYPE_F32 || mask->type != GGML_TYPE_F16 ||
                     op->type != GGML_TYPE_I32 || op->ne[0] <= 0 || op->ne[0] > 2048 ||
                     op->ne[0] > k->ne[2]) {
