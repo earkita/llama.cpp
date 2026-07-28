@@ -496,6 +496,12 @@ Token and stream batching multiply both graph-visible output columns by `T*S`. T
 
 The standalone score operation still writes `4*C*T*S` output bytes and remains available for callers that consume scores. It has no temporary Vulkan allocation, but its graph-visible output scales as `O(C*T*S)`.
 
+## Stage 7 candidate-tile optimization
+
+The optimized shader processes 128 candidates per workgroup iteration. Each invocation computes one complete candidate score, and invocation zero merges the tile into the shared top-k heap. This changes the workgroup loop count from `C` to `ceil(C/128)` and removes the per-head reduction barriers from the main path.
+
+Set `GGML_VK_DISABLE_LIGHTNING_INDEXER_CANDIDATE_TILE=1` to select the Stage 6 fallback for comparison benchmarks. Both paths use FP32 accumulation, one dispatch, no global temporary storage, and the same deterministic top-k heap.
+
 Result: passed, 108/108 cases. Coverage included `H = 32 or 64`, `T = 1 or 512`, `S = 1 or 4`, shared and per-stream masks, and F32, F16, BF16, Q8_0, Q5_1, Q5_0, Q4_1, Q4_0, and IQ4_NL keys.
 
 The test process reported `ggml_vulkan: No devices found`, so no Vulkan execution baseline was possible in this environment. This is expected before the operation is implemented but means later Vulkan correctness and validation criteria require access to the target GPU environment.

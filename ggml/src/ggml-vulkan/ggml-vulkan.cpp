@@ -1005,6 +1005,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_gated_delta_net[4][2];
     vk_pipeline pipeline_lightning_indexer_f32;
     vk_pipeline pipeline_lightning_indexer_top_k_f32;
+    vk_pipeline pipeline_lightning_indexer_top_k_f32_candidate_tile;
     vk_pipeline pipeline_ssm_scan_f32_d128;
     vk_pipeline pipeline_ssm_scan_f32_d256;
     vk_pipeline pipeline_ssm_conv_f32;
@@ -5686,6 +5687,12 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         ggml_vk_create_pipeline(device, device->pipeline_lightning_indexer_top_k_f32,
             "lightning_indexer_top_k_f32", lightning_indexer_top_k_f32_len, lightning_indexer_top_k_f32_data, "main", 5,
             sizeof(vk_op_lightning_indexer_top_k_push_constants), {128, 1, 1}, {}, 1);
+        if (getenv("GGML_VK_DISABLE_LIGHTNING_INDEXER_CANDIDATE_TILE") == nullptr) {
+            ggml_vk_create_pipeline(device, device->pipeline_lightning_indexer_top_k_f32_candidate_tile,
+                "lightning_indexer_top_k_f32_candidate_tile", lightning_indexer_top_k_f32_candidate_tile_len,
+                lightning_indexer_top_k_f32_candidate_tile_data, "main", 5,
+                sizeof(vk_op_lightning_indexer_top_k_push_constants), {128, 1, 1}, {}, 1);
+        }
     }
 
     if (device->subgroup_arithmetic && device->subgroup_require_full_support) {
@@ -11374,6 +11381,9 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
             src2->type == GGML_TYPE_F32 && dst->src[3] && dst->src[3]->type == GGML_TYPE_F16 &&
             dst->type == GGML_TYPE_I32) {
+            if (ctx->device->pipeline_lightning_indexer_top_k_f32_candidate_tile) {
+                return ctx->device->pipeline_lightning_indexer_top_k_f32_candidate_tile;
+            }
             return ctx->device->pipeline_lightning_indexer_top_k_f32;
         }
         return nullptr;

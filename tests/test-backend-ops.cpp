@@ -10249,6 +10249,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             }
         }
     }
+    for (int kv : { 4096, 16384, 32768, 65536 }) {
+        test_cases.emplace_back(new test_lightning_indexer_top_k(32, kv, 1, 1, 1, 2048));
+    }
+    test_cases.emplace_back(new test_lightning_indexer_top_k(32, 4096, 4, 1, 1, 512));
+    test_cases.emplace_back(new test_lightning_indexer_top_k(32, 16384, 1, 1, 1, 512));
 
     return test_cases;
 }
