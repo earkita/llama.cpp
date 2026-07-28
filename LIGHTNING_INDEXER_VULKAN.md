@@ -2,9 +2,9 @@
 
 ## Current stage
 
-Stage 2 - deterministic CPU reference coverage complete.
+Stage 3 - Vulkan implementation design complete.
 
-Stage 3 and Vulkan implementation work have not started.
+Vulkan implementation work has not started.
 
 Baseline revision: `ee3d1b54c server: abstract llama_memory calls to common_memory (#26221)`.
 
@@ -216,9 +216,218 @@ This is a Stage 1 decomposition, not a selected design:
 
 Because top-k is a separate graph node, a bounded-memory fused score-plus-top-k pipeline cannot be implemented solely as support for the existing operation. Stage 3 must decide whether to implement the current score contract directly or propose a separately scoped graph fusion after correctness is established.
 
+## Vulkan infrastructure review
+
+The backend already provides the required integration patterns:
+
+- Pipelines are stored per `vk_device`, compiled by `vulkan-shaders-gen.cpp`, registered with `ggml_vk_create_pipeline` or `ggml_vk_create_pipeline2`, selected in `ggml_vk_op_get_pipeline`, and dispatched with descriptor-backed tensor subbuffers and push constants.
+- Capability checks live in the Vulkan `supports_op` switch and can inspect types, dimensions, contiguity, device features, workgroup limits, and whether a required pipeline was created.
+- Tensor offsets are represented by Vulkan subbuffers. Operation-specific strides are normally passed in element units through push constants.
+- `sum_rows.comp` shows a portable shared-memory reduction with barriers and a specialization-constant workgroup size.
+- `gated_delta_net.comp` shows a fused multi-input F32 operation specialized by model dimension. It selects subgroup arithmetic, clustered operations, or a shared-memory fallback according to device capabilities.
+- `topk_nary_search.comp` uses subgroup arithmetic, ballot, shuffle, full-subgroup execution, and device subgroup-size specialization when those capabilities exist.
+- `topk_argsort.comp` is the shared-memory fallback for devices without the richer subgroup feature set.
+- `ggml_vk_topk` performs hierarchical top-k with a double-buffered preallocated scratch buffer and explicit synchronization between passes.
+- Large argsort and split-K matrix/attention paths show preallocation through `prealloc_x` or `prealloc_split_k`, descriptor reservation, storage-range checks, and synchronization of reused scratch buffers.
+- Existing graph fusion is recognized by `ggml_vk_can_fuse` over consecutive graph nodes and dispatched by setting `num_additional_fused_ops`. This is the relevant mechanism for a future Lightning Indexer plus top-k fusion, but no such fusion exists today.
+
+The existing top-k implementation already has the required downstream Vulkan operation. Initial Lightning Indexer support should reuse it as a separate graph node rather than introduce sorting code into the score shader.
+
+## Vulkan design alternatives
+
+Let:
+
+- `N = T * S`, the total number of query rows across streams.
+- `C`, the cached-key count.
+- `D = 128`.
+- `H = 32 or 64`.
+- `B`, a cached-key tile size.
+- `K`, the downstream top-k count.
+
+The arithmetic cost of every exact design is `O(N * C * H * D)`.
+
+### Design A - one score per workgroup
+
+Dispatch one workgroup for each `(candidate, query, stream)` output. Use 128 invocations so each invocation loads one F32 query and key component. For each head:
+
+1. Each invocation multiplies one `q[d] * k[d]`.
+2. Reduce the 128 products in shared memory.
+3. Invocation 0 applies ReLU, multiplies the head weight, and adds it to the score.
+4. After all heads, invocation 0 adds the F16 mask and writes one F32 output.
+
+Properties:
+
+- Dispatches: 1.
+- Workgroups: `C * N`.
+- Global temporary buffer: 0 bytes.
+- Shared memory: 128 F32 values, or 512 bytes per workgroup.
+- Register storage: one score accumulator plus a few scalar values per invocation.
+- Synchronization: workgroup barriers during each head reduction; no inter-dispatch barrier.
+- Subgroup assumptions: none.
+- Required features: baseline compute shader support plus F16 storage/load support already required by the backend mask representation. Arithmetic can remain F32.
+- Memory complexity: required output `4 * C * N` bytes and `O(1)` backend scratch.
+
+Advantages:
+
+- Closest to the CPU formula.
+- Simple stride and mask indexing.
+- Portable across AMD and NVIDIA subgroup sizes.
+- Suitable as a correctness-first implementation.
+
+Risks:
+
+- Each query vector is reread for every candidate.
+- There are `H` shared-memory reductions and barriers per output.
+- Small workgroups and repeated query loads are likely bandwidth- and synchronization-heavy.
+- `C * N` workgroups must be mapped within device dispatch-count limits, potentially using shader-side loops when a dimension exceeds `maxComputeWorkGroupCount`.
+
+This is the selected Stage 5 correctness-first design.
+
+### Design B - tiled candidates with query reuse
+
+Dispatch one workgroup for a tile of `B` cached keys and one query row. Stage a chunk of query heads and weights in shared memory, load key vectors cooperatively, and compute several candidate scores per workgroup. Head processing remains chunked so shared-memory use is bounded.
+
+A portable form uses a fixed workgroup size such as 128 or 256 and shared-memory reduction. An optimized form assigns candidate reductions to subgroups, specializing for the actual device subgroup size rather than assuming 32 lanes.
+
+Example with four staged query heads:
+
+```text
+query shared memory = 4 * 128 * 4 = 2048 bytes
+weight shared memory = 4 * 4 = 16 bytes
+reduction/candidate staging depends on B and workgroup mapping
+```
+
+Properties:
+
+- Dispatches: 1.
+- Workgroups: approximately `ceil(C / B) * N`.
+- Global temporary buffer: 0 bytes.
+- Shared memory: `O(D * head_chunk + B)` with fixed compile-time tile limits.
+- Synchronization: barriers between query-head chunks and any shared reductions.
+- Subgroup assumptions: the fallback requires none; optimized variants use the runtime-selected subgroup size and require capability checks.
+- Memory complexity: required output `4 * C * N` bytes and `O(1)` backend scratch.
+
+Advantages:
+
+- Reuses queries and weights across cached keys.
+- Fewer workgroups and global query loads than Design A.
+- Keeps scratch independent of context length.
+- Can add F16, BF16, and quantized key loaders later without changing the output contract.
+
+Risks:
+
+- More indexing and synchronization complexity.
+- Register pressure grows with candidates per invocation.
+- A subgroup implementation must handle AMD wave32/wave64 and NVIDIA warp32 correctly.
+- The best `B`, head chunk, and workgroup size are device-dependent.
+
+This is the intended optimized implementation after Design A is correct. Stage 7 should benchmark shared-memory and subgroup variants rather than replacing the portable path.
+
+### Design C - graph-fused score and top-k
+
+Recognize the consecutive `LIGHTNING_INDEXER -> TOP_K` graph nodes in the Vulkan fusion pass. Process cached keys in tiles, retain candidate/value pairs, and merge them hierarchically until only `K` indices per query remain. The intermediate Lightning Indexer score tensor is never written.
+
+Possible implementations:
+
+- A persistent workgroup per query scans all key tiles and maintains `K` candidates in shared memory. Scratch is `O(K * N)` but occupancy and latency are poor when `N` is small or `K` is large.
+- A hierarchical approach emits `K` candidates per `(query, key tile)`, then repeatedly merges candidate tiles. First-pass scratch is approximately `8 * K * ceil(C / B) * N` bytes for I32 indices and F32 scores, with later passes decreasing geometrically. Double buffering can double the peak.
+
+Properties:
+
+- Dispatches: at least 2, normally `1 + ceil(log_B(C / K))` merge passes.
+- Synchronization: one command-buffer barrier or backend scratch synchronization between passes.
+- Time complexity: score calculation remains `O(N * C * H * D)`; candidate merging avoids sorting all `C` values.
+- Memory complexity: `O(K * N)` for a persistent design or `O(K * ceil(C / B) * N)` for a hierarchical design.
+- Subgroup assumptions: none for a shared-memory fallback; subgroup ballot/arithmetic/shuffle can accelerate compaction and merge when explicitly supported.
+
+Advantages:
+
+- Removes the required `4 * C * N` score output from physical memory when fusion is active.
+- Provides the credible path to large context with large ubatches.
+- Reuses existing Vulkan graph-fusion and hierarchical top-k concepts.
+
+Risks:
+
+- It is not an implementation of `GGML_OP_LIGHTNING_INDEXER` alone.
+- The fusion must preserve unfused graph semantics, graph lifetime rules, diagnostics, and fallback when either node is unsupported.
+- Top-k tie ordering is backend-dependent, so validation must compare allowed selected values/sets.
+- `K`, tile size, and shared-memory limits can make a persistent design impractical.
+- This is a larger architectural change and must not be mixed into the correctness-first patch without prior maintainer discussion.
+
+Design C is not selected for the first implementation. It is the explicit path for eliminating context-by-ubatch score storage after Designs A and B establish correctness.
+
+## Memory scaling estimates
+
+The score operation itself does not materialize an `H * C * N` tensor. Designs A and B write only the required F32 result:
+
+| Context `C` | `N = 1` | `N = 32` | `N = 512` |
+| ---: | ---: | ---: | ---: |
+| 1K | 4 KiB | 128 KiB | 2 MiB |
+| 4K | 16 KiB | 512 KiB | 8 MiB |
+| 16K | 64 KiB | 2 MiB | 32 MiB |
+| 32K | 128 KiB | 4 MiB | 64 MiB |
+| 64K | 256 KiB | 8 MiB | 128 MiB |
+| 262K | about 1 MiB | about 32 MiB | about 512 MiB |
+| 1M | about 4 MiB | about 128 MiB | about 2 GiB |
+
+These figures exclude allocator alignment and downstream top-k scratch. They show that direct score output is reasonable for token generation and small ubatches, but becomes material at long context with large prompt-processing batches. Designs A and B do not introduce another context-proportional allocation. Design C is required if the output itself becomes the limiting allocation.
+
+A rejected prototype is the unfused-equivalent approach that first writes all head scores. Its F32 intermediate would be:
+
+```text
+4 * H * C * N bytes
+```
+
+At `H = 64`, `C = 262K`, and `N = 32`, this is about 2 GiB before the final score output. At `N = 512`, it is about 32 GiB. This design is impractical and will not be implemented.
+
+## Initial Vulkan support boundary
+
+The first implementation should advertise support only for:
+
+- `q`, `weights`, and `dst`: F32.
+- `mask`: F16.
+- `k`: F32 only.
+- `D = 128`.
+- `H = 32 or 64`.
+- `k.ne[1] = 1`, `weights.ne[2] = 1`, and `mask.ne[2] = 1`.
+- The constructor shape relationships documented above.
+- Contiguous dimension-0 rows for every tensor.
+- Higher-dimensional strides expressible in the 32-bit element-stride push constants.
+- An unpermuted, contiguous F32 output.
+- `S % M = 0`, with mask selection by `s % M`.
+- A device workgroup size of at least 128 invocations and at least 512 bytes of compute shared memory.
+- Dispatch dimensions that can be covered directly or by an explicitly implemented shader-side loop within the device's `maxComputeWorkGroupCount` limits.
+
+No top-k limit belongs to the standalone score operation. When a future graph fusion is added, it must separately constrain `K` according to available top-k pipelines, shared memory, and storage-buffer limits.
+
+F16, BF16, and quantized key types are deferred. Support checks must return false for them until the corresponding shader load and conversion paths are implemented and tested. Cooperative matrices, subgroup arithmetic, subgroup ballot, subgroup shuffle, subgroup-size control, and the Vulkan memory model are not required by Design A.
+
+## AMD and NVIDIA behavior
+
+Design A uses workgroup shared memory and barriers, so it is independent of subgroup width. A 128-invocation workgroup contains two wave64 subgroups or four wave32/warp32 subgroups, but correctness does not depend on that partition.
+
+Design B may use subgroup operations only in a pipeline specialized for the actual device subgroup size. The backend already records subgroup basic, arithmetic, ballot, shuffle, full-subgroup, and subgroup-size-control capabilities and demonstrates capability-selected fallbacks in top-k and Gated Delta Net. No shader may assume subgroup size 32.
+
+Expected tradeoffs:
+
+- AMD wave64 may reduce the number of subgroups needed for a 128-element dot product but can increase inactive lanes for narrower mappings.
+- AMD wave32 and NVIDIA warp32 are natural for two-stage 128-element reductions.
+- Shared-memory fallback should work on both vendors but will likely be slower than subgroup reductions.
+- Cooperative-matrix acceleration is optional future work and cannot be a support requirement for the first implementation.
+
+## Chosen implementation path
+
+1. Stage 4 adds recognition, a pipeline slot, shader registration scaffolding, dispatch plumbing, and the conservative F32-only support check. It must continue returning false until an executable kernel is present.
+2. Stage 5 implements Design A and enables only the documented subset.
+3. Stage 6 measures actual score output and top-k scratch scaling. Since Design A has no backend scratch, instrumentation must distinguish graph output allocation from backend preallocation.
+4. Stage 7 implements and benchmarks Design B while retaining Design A as the portable fallback.
+5. A Design C graph fusion is considered only after correctness and measurements demonstrate that score output is the limiting allocation, and after the larger graph change is discussed with maintainers.
+
+This path avoids the rejected head-score matrix, has bounded backend scratch from the first kernel, and preserves a route to eliminating the context-by-ubatch output when justified.
+
 ## Supported device capabilities
 
-No Vulkan support is implemented or advertised at Stage 1.
+No Vulkan support is implemented or advertised as of Stage 3.
 
 CUDA currently supports only `D = 128`, `H = 32 or 64`, and key types F32, BF16, F16, Q8_0, Q5_1, Q5_0, Q4_1, and Q4_0, subject to its alignment checks. These are observations, not proposed Vulkan support claims.
 
@@ -298,9 +507,9 @@ Top-k-specific cases from the original plan were not added to this operation tes
 
 ## Benchmark results
 
-No benchmarks were run in Stage 1 or Stage 2.
+No benchmarks were run in Stages 1 through 3.
 
 ## Remaining work
 
-- Commit the Stage 2 CPU reference coverage.
-- Begin Stage 3 design work only after the Stage 2 commit.
+- Commit the Stage 3 Vulkan design.
+- Begin Stage 4 scaffolding only after the Stage 3 commit.
