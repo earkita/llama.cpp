@@ -1,0 +1,30 @@
+#version 450
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Parameters {
+    uint D;
+    uint H;
+    uint T;
+    uint S;
+    uint C;
+    uint M;
+    uint q1;
+    uint q2;
+    uint q3;
+    uint k2;
+    uint k3;
+    uint w1;
+    uint w3;
+    uint m1;
+    uint m3;
+};
+
+layout(binding = 0) readonly buffer QBuf       { float data_q[];       };
+layout(binding = 1) readonly buffer KBuf       { float data_k[];       };
+layout(binding = 2) readonly buffer WeightsBuf { float data_weights[]; };
+layout(binding = 3) readonly buffer MaskBuf    { uint  data_mask[];    };
+layout(binding = 4)          buffer DstBuf     { float data_dst[];     };
+
+void main() {
+}
