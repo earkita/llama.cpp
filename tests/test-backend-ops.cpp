@@ -7351,6 +7351,171 @@ struct test_lightning_indexer : public test_case {
     }
 };
 
+struct test_lightning_indexer_reference : public test_lightning_indexer {
+    const std::string case_name;
+    std::vector<float> expected;
+    std::vector<std::vector<float>> inputs;
+
+    std::string vars() override {
+        return test_lightning_indexer::vars() + ",case=" + case_name;
+    }
+
+    double max_nmse_err() override {
+        return 1e-5;
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        for (const auto & input : inputs) {
+            if (input.size() == n &&
+                std::equal(input.begin(), input.end(), a) &&
+                std::equal(input.begin(), input.end(), b)) {
+                return test_lightning_indexer::err(a, b, n);
+            }
+        }
+        if (n != expected.size()) {
+            return test_lightning_indexer::err(a, b, n);
+        }
+
+        double max_diff = 0.0;
+        size_t first_diff = n;
+        for (size_t i = 0; i < n; ++i) {
+            for (float actual : {a[i], b[i]}) {
+                double diff;
+                if (std::isinf(expected[i]) || std::isinf(actual)) {
+                    diff = expected[i] == actual ? 0.0 : INFINITY;
+                } else {
+                    diff = std::fabs(expected[i] - actual);
+                }
+                if (diff > max_nmse_err() && first_diff == n) {
+                    first_diff = i;
+                }
+                max_diff = std::max(max_diff, diff);
+            }
+        }
+
+        if (first_diff != n) {
+            const int64_t c = first_diff % kv;
+            const int64_t t = (first_diff / kv) % nb;
+            const int64_t s = first_diff / (kv * nb);
+            printf("[case=%s,dims=[D=%" PRId64 ",H=%" PRId64 ",C=%" PRId64 ",T=%" PRId64 ",S=%" PRId64
+                   ",M=%" PRId64 "],first_diff=[c=%" PRId64 ",t=%" PRId64 ",s=%" PRId64
+                   "],expected=%f,result_a=%f,result_b=%f] ",
+                   case_name.c_str(), hsk, nh, kv, nb, ns, nm, c, t, s,
+                   expected[first_diff], a[first_diff], b[first_diff]);
+        }
+        return max_diff;
+    }
+
+    test_lightning_indexer_reference(
+            const char * case_name,
+            int64_t hsk,
+            int64_t nh,
+            int64_t kv,
+            int64_t nb,
+            int64_t ns,
+            int64_t nm)
+        : test_lightning_indexer(hsk, nh, kv, nb, ns, nm, GGML_TYPE_F32),
+          case_name(case_name) {
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::vector<float> q(hsk * nh * nb * ns, 0.0f);
+        std::vector<float> k(hsk * kv * ns, 0.0f);
+        std::vector<float> w(nh * nb * ns, 0.0f);
+        std::vector<float> mask_f32(kv * nb * nm, 0.0f);
+        std::vector<ggml_fp16_t> mask_f16(mask_f32.size());
+
+        if (case_name == "scalar") {
+            q[0] = 4.0f;
+            k[0] = 3.0f;
+            w[0] = 0.5f;
+            mask_f32[0] = -1.0f;
+        } else {
+            for (int64_t s = 0; s < ns; ++s) {
+                for (int64_t t = 0; t < nb; ++t) {
+                    for (int64_t h = 0; h < nh; ++h) {
+                        const size_t base = hsk * (h + nh * (t + nb * s));
+                        q[base + 0] = float((h + 2 * t + s) % 5) - 2.0f;
+                        q[base + 1] = float((2 * h + t + s) % 3) - 1.0f;
+                        q[base + 2] = 0.001f * float(1 + (h + t) % 3);
+
+                        static const float weight_values[] = {-1.0f, 0.5f, 1.0f, 2.0f};
+                        w[h + nh * (t + nb * s)] = weight_values[(h + t + s) % 4];
+                    }
+                }
+
+                for (int64_t c = 0; c < kv; ++c) {
+                    const size_t base = hsk * (c + kv * s);
+                    k[base + 0] = float((c + s) % 5) - 2.0f;
+                    k[base + 1] = float((2 * c + s) % 3) - 1.0f;
+                    k[base + 2] = 0.001f * float(1 + c % 3);
+                }
+
+                if (kv > 3) {
+                    const size_t src = hsk * (2 + kv * s);
+                    const size_t dst = hsk * (3 + kv * s);
+                    std::copy(k.begin() + src, k.begin() + src + hsk, k.begin() + dst);
+                }
+                if (kv > 1) {
+                    const size_t last = hsk * (kv - 1 + kv * s);
+                    k[last + 0] = 4.0f;
+                    k[last + 1] = 0.0f;
+                    k[last + 2] = 0.0f;
+                }
+            }
+
+            for (int64_t ms = 0; ms < nm; ++ms) {
+                for (int64_t t = 0; t < nb; ++t) {
+                    for (int64_t c = 0; c < kv; ++c) {
+                        const size_t i = c + kv * (t + nb * ms);
+                        mask_f32[i] = 0.5f * float((c + t + ms) % 3 - 1);
+                        if ((c == 1 && t == 0) || (case_name == "mask_reuse" && c == 0 && t == 1)) {
+                            mask_f32[i] = -INFINITY;
+                        }
+                    }
+                }
+            }
+        }
+
+        ggml_fp32_to_fp16_row(mask_f32.data(), mask_f16.data(), mask_f32.size());
+        std::vector<float> mask(mask_f16.size());
+        ggml_fp16_to_fp32_row(mask_f16.data(), mask.data(), mask.size());
+        inputs = {q, k, w, mask};
+        expected.assign(kv * nb * ns, 0.0f);
+        for (int64_t s = 0; s < ns; ++s) {
+            for (int64_t t = 0; t < nb; ++t) {
+                for (int64_t c = 0; c < kv; ++c) {
+                    float score = 0.0f;
+                    for (int64_t h = 0; h < nh; ++h) {
+                        float qk = 0.0f;
+                        for (int64_t d = 0; d < hsk; ++d) {
+                            qk += q[d + hsk * (h + nh * (t + nb * s))] *
+                                  k[d + hsk * (c + kv * s)];
+                        }
+                        score += std::max(qk, 0.0f) * w[h + nh * (t + nb * s)];
+                    }
+                    const size_t mask_i = c + kv * (t + nb * (s % nm));
+                    expected[c + kv * (t + nb * s)] = score + ggml_fp16_to_fp32(mask_f16[mask_i]);
+                }
+            }
+        }
+
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "q") == 0) {
+                ggml_backend_tensor_set(t, q.data(), 0, q.size() * sizeof(float));
+            } else if (strcmp(t->name, "k") == 0) {
+                ggml_backend_tensor_set(t, k.data(), 0, k.size() * sizeof(float));
+            } else if (strcmp(t->name, "w") == 0) {
+                ggml_backend_tensor_set(t, w.data(), 0, w.size() * sizeof(float));
+            } else if (strcmp(t->name, "m") == 0) {
+                ggml_backend_tensor_set(t, mask_f16.data(), 0, mask_f16.size() * sizeof(ggml_fp16_t));
+            } else {
+                init_tensor_uniform(t, 0.0f, 0.0f);
+            }
+        }
+    }
+};
+
 // Deserializable generic test case
 struct input_tensor {
     ggml_type type;
@@ -9695,6 +9860,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+    test_cases.emplace_back(new test_lightning_indexer_reference("scalar",     1,   1,  1, 1, 1, 1));
+    test_cases.emplace_back(new test_lightning_indexer_reference("relu_order", 128, 32, 7, 3, 1, 1));
+    test_cases.emplace_back(new test_lightning_indexer_reference("mask_reuse", 128, 32, 65, 2, 4, 2));
 
     return test_cases;
 }

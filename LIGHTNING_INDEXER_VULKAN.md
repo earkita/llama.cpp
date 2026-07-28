@@ -2,9 +2,9 @@
 
 ## Current stage
 
-Stage 1 - operation specification.
+Stage 2 - deterministic CPU reference coverage complete.
 
-Stage 2 and Vulkan implementation work have not started.
+Stage 3 and Vulkan implementation work have not started.
 
 Baseline revision: `ee3d1b54c server: abstract llama_memory calls to common_memory (#26221)`.
 
@@ -262,12 +262,45 @@ Result: passed, 108/108 cases. Coverage included `H = 32 or 64`, `T = 1 or 512`,
 
 The test process reported `ggml_vulkan: No devices found`, so no Vulkan execution baseline was possible in this environment. This is expected before the operation is implemented but means later Vulkan correctness and validation criteria require access to the target GPU environment.
 
+Stage 2 added three deterministic F32 reference cases to `test-backend-ops`:
+
+- `scalar`: minimum dimensions with a hard-coded expected score.
+- `relu_order`: `D = 128`, `H = 32`, multiple query tokens, positive and negative dot products, negative weights, equal and nearly equal key values, finite masks, and `-INFINITY` masks.
+- `mask_reuse`: `C = 65`, `T = 2`, `S = 4`, and `M = 2`, covering non-divisible candidate counts, mask indexing by `s % M`, masked entries, and the maximum candidate index.
+
+The deterministic reference independently evaluates every output score in scalar F32 order. The comparison uses a `1e-5` absolute bound; the largest difference observed while developing the test was `3.815e-6`, caused by the CPU vector dot-product reduction order differing from the scalar reference. Infinite expected values must match exactly in sign. Failure output includes the case name, dimensions, first differing `[candidate, query, stream]` coordinate, expected value, and both backend results.
+
+Build command:
+
+```sh
+cmake --build build-vulkan-debug --target test-backend-ops -j"$(nproc)"
+```
+
+Result: passed.
+
+Focused deterministic command:
+
+```sh
+build-vulkan-debug/bin/test-backend-ops test -o LIGHTNING_INDEXER -b CPU -p 'case='
+```
+
+Result: passed, 3/3 cases. The command was run twice with the same result.
+
+Complete Lightning Indexer command:
+
+```sh
+build-vulkan-debug/bin/test-backend-ops test -o LIGHTNING_INDEXER -b CPU
+```
+
+Result: passed, 111/111 cases. No full model is required.
+
+Top-k-specific cases from the original plan were not added to this operation test because Stage 1 established that `GGML_OP_TOP_K` is a separate downstream operation with existing dedicated coverage. Position offsets are represented only through additive mask values because Lightning Indexer has no position input or parameter.
+
 ## Benchmark results
 
-No benchmarks were run in Stage 1.
+No benchmarks were run in Stage 1 or Stage 2.
 
 ## Remaining work
 
-- Complete and record the clean baseline build and relevant CPU/Vulkan backend tests.
-- Commit the Stage 1 specification.
-- Do not start Stage 2 until the Stage 1 exit criteria and commit are complete.
+- Commit the Stage 2 CPU reference coverage.
+- Begin Stage 3 design work only after the Stage 2 commit.
