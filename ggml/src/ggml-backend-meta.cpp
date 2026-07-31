@@ -745,11 +745,16 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     };
 
     auto handle_flash_attn_ext = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        GGML_ASSERT(tensor->src[4] == nullptr || src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        GGML_ASSERT(tensor->src[4] == nullptr || src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_0);
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_3 &&
+                src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_3 &&
+                src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_3) {
+            return {GGML_BACKEND_SPLIT_AXIS_3, {0}, {1}, 1};
+        }
         GGML_ASSERT(                             src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_2);
         GGML_ASSERT(                             src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_2);
         GGML_ASSERT(                             src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_2);
-        GGML_ASSERT(tensor->src[4] == nullptr || src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
-        GGML_ASSERT(tensor->src[4] == nullptr || src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_0);
         return {GGML_BACKEND_SPLIT_AXIS_1, {0}, {1}, 1};
     };
 
@@ -1203,9 +1208,23 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
         }
         if (t_ij->view_src != nullptr) {
             t_ij->data = (char *) t_ij->view_src->data + t_ij->view_offs;
-        } else if (simple_buf != nullptr) {
+            if (t_ij->view_src->buffer != nullptr) {
+                t_ij->buffer = t_ij->view_src->buffer;
+            }
+        } else if (simple_buf != nullptr && !ggml_backend_buffer_is_multi_buffer(simple_buf)) {
+            // single contiguous buffer: mirror the offset. A multi-buffer has no usable base, so leave the
+            // tensor for the gallocr to place (alloc_ctx_tensors assigns each tensor a real sub-buffer).
             t_ij->data = (char *) ggml_backend_buffer_get_base(simple_buf)
                 + size_t(tensor->data) - size_t(ggml_backend_buffer_get_base(tensor->buffer));
+        }
+        // Backends require the physical buffer, not the multi-buffer wrapper (its context is unusable).
+        // Resolve it from the tensor's data address -- works for any tensor, not just views.
+        if (t_ij->buffer != nullptr && t_ij->data != nullptr
+                && ggml_backend_buffer_is_multi_buffer(t_ij->buffer)) {
+            ggml_backend_buffer_t sub = ggml_backend_multi_buffer_get_buffer(t_ij->buffer, t_ij->data);
+            if (sub != nullptr) {
+                t_ij->buffer = sub;
+            }
         }
         t_ij->extra = tensor->extra;
         for (int i = 0; i < GGML_MAX_SRC; i++) {
@@ -1850,6 +1869,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 auto skip_unrelated = [&]() {
                     while (id + 1 < cgraph->n_nodes) {
                         ggml_tensor * next = cgraph->nodes[id+1];
+                        if (next->view_src != nullptr && next->view_src->op == GGML_OP_NONE && ggml_backend_buffer_is_host(next->view_src->buffer)) {
+                            break;
+                        }
                         if (ggml_backend_meta_get_split_state(next, false).axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
                             break;
                         }
@@ -1939,17 +1961,26 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 return idr;
             };
 
+            auto is_host_view = [](const ggml_tensor * node) {
+                return node->view_src != nullptr && node->view_src->op == GGML_OP_NONE && ggml_backend_buffer_is_host(node->view_src->buffer);
+            };
+
+            int i_last_compute = cgraph->n_nodes - 1;
+            while (i_last_compute >= 0 && is_host_view(cgraph->nodes[i_last_compute])) {
+                i_last_compute--;
+            }
+
             int i_start = 0;
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
-                if (node->view_src != nullptr && node->view_src->op == GGML_OP_NONE && ggml_backend_buffer_is_host(node->view_src->buffer)) {
+                if (is_host_view(node)) {
                     continue;
                 }
                 const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(node, /*assume_sync =*/ false);
                 if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
                     max_tmp_size = std::max(max_tmp_size, ggml_nbytes(node));
                 }
-                const bool new_subgraph = i + 1 == cgraph->n_nodes || split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL;
+                const bool new_subgraph = i == i_last_compute || split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL;
                 if (!new_subgraph) {
                     continue;
                 }
@@ -1979,6 +2010,15 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 }
                 n_subgraphs++;
                 i_start = i + 1;
+            }
+            if (i_start < cgraph->n_nodes && n_subgraphs > 0) {
+                bool trailing_host_views = true;
+                for (int i = i_start; i < cgraph->n_nodes; i++) {
+                    trailing_host_views &= is_host_view(cgraph->nodes[i]);
+                }
+                if (trailing_host_views) {
+                    i_start = cgraph->n_nodes;
+                }
             }
             GGML_ASSERT(i_start == cgraph->n_nodes);
         }
@@ -2030,7 +2070,16 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             for (size_t i_graph = 0; i_graph < n_subgraphs; i_graph++) {
                 ggml_cgraph * cgraph_ij = bcj.cgraphs[i_graph].cgraph_main;
                 const size_t i_node_start = bcj.cgraphs[i_graph].offset;
-                const size_t i_node_stop = i_graph + 1 < n_subgraphs ? bcj.cgraphs[i_graph + 1].offset : cgraph->n_nodes;
+                size_t i_node_stop = i_graph + 1 < n_subgraphs ? bcj.cgraphs[i_graph + 1].offset : cgraph->n_nodes;
+                if (i_graph + 1 == n_subgraphs) {
+                    while (i_node_stop > i_node_start) {
+                        const ggml_tensor * node = cgraph->nodes[i_node_stop - 1];
+                        if (node->view_src == nullptr || node->view_src->op != GGML_OP_NONE || !ggml_backend_buffer_is_host(node->view_src->buffer)) {
+                            break;
+                        }
+                        i_node_stop--;
+                    }
+                }
                 cgraph_ij->n_nodes = i_node_stop - i_node_start;
                 ggml_hash_set_reset(&cgraph_ij->visited_hash_set);
                 for (size_t i_node = i_node_start; i_node < i_node_stop; i_node++) {
