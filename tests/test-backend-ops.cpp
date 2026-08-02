@@ -9728,6 +9728,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+    test_cases.emplace_back(new test_lightning_indexer(128, 32, 129, 1, 1, 1, GGML_TYPE_F32));
+    test_cases.emplace_back(new test_lightning_indexer(128, 32, 129, 1, 1, 1, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_lightning_indexer(128, 32, 129, 1, 1, 1, GGML_TYPE_Q4_0));
+    test_cases.emplace_back(new test_lightning_indexer(128, 32, 129, 1, 1, 1, GGML_TYPE_Q4_1));
 
     return test_cases;
 }

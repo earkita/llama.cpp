@@ -1,0 +1,84 @@
+#version 450
+
+#extension GL_EXT_shader_16bit_storage : require
+
+#if defined(DATA_A_Q4_0) || defined(DATA_A_Q4_1)
+#include "types.glsl"
+#elif defined(DATA_A_F32)
+#define A_TYPE float
+#elif defined(DATA_A_F16)
+#define A_TYPE float16_t
+#else
+#error unsupported key type
+#endif
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter {
+    uint n_head;
+    uint n_tokens;
+    uint n_kv;
+    uint n_mask_stream;
+    uint q1;
+    uint q2;
+    uint q3;
+    uint k2;
+    uint k3;
+    uint w1;
+    uint w3;
+    uint m1;
+    uint m3;
+};
+
+layout(binding = 0) readonly buffer q_buf      { float     q[];       };
+layout(binding = 1) readonly buffer k_buf      { A_TYPE    k[];       };
+layout(binding = 2) readonly buffer weight_buf { float     weights[]; };
+layout(binding = 3) readonly buffer mask_buf   { float16_t mask[];    };
+layout(binding = 4)          buffer dst_buf    { float     dst[];     };
+
+shared float query[128];
+
+float load_k(uint base, uint i) {
+#if defined(DATA_A_Q4_0) || defined(DATA_A_Q4_1)
+    const uint ib = base + i / QUANT_K;
+    const uint iq = i % QUANT_K;
+    const uint qv = uint(k[ib].qs[iq % 16]);
+    const float v = float(iq < 16 ? qv & 0x0f : qv >> 4);
+#if defined(DATA_A_Q4_0)
+    return float(k[ib].d) * (v - 8.0);
+#else
+    return float(k[ib].d) * v + float(k[ib].m);
+#endif
+#else
+    return float(k[base + i]);
+#endif
+}
+
+void main() {
+    const uint d = gl_LocalInvocationID.x;
+    const uint c = gl_GlobalInvocationID.x;
+    const uint t = gl_WorkGroupID.y;
+    const uint s = gl_WorkGroupID.z;
+
+    float score = 0.0;
+    const uint k_base = c < n_kv ? c * k2 + s * k3 : 0;
+
+    for (uint h = 0; h < n_head; ++h) {
+        query[d] = q[h * q1 + t * q2 + s * q3 + d];
+        barrier();
+
+        if (c < n_kv) {
+            float qk = 0.0;
+            for (uint i = 0; i < 128; ++i) {
+                qk += query[i] * load_k(k_base, i);
+            }
+            score += max(qk, 0.0) * weights[h + t * w1 + s * w3];
+        }
+        barrier();
+    }
+
+    if (c < n_kv) {
+        const uint mask_index = c + t * m1 + (s % n_mask_stream) * m3;
+        dst[c + n_kv * t + n_kv * n_tokens * s] = score + float(mask[mask_index]);
+    }
+}
